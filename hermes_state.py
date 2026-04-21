@@ -650,16 +650,39 @@ class SessionDB:
             row = cursor.fetchone()
         return row["title"] if row else None
 
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
-        """Look up a session by exact title. Returns session dict or None."""
+    def get_session_by_title(
+        self,
+        title: str,
+        *,
+        source: str | None = None,
+        user_id: str | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Look up a session by exact title. Returns session dict or None.
+
+        Optional ``source`` / ``user_id`` filters let gateway callers scope
+        title resolution to the current user's platform lane and avoid
+        cross-user session leakage in shared state.db deployments.
+        """
+        query = "SELECT * FROM sessions WHERE title = ?"
+        params: list[Any] = [title]
+        if source is not None:
+            query += " AND source = ?"
+            params.append(source)
+        if user_id is not None:
+            query += " AND user_id = ?"
+            params.append(user_id)
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE title = ?", (title,)
-            )
+            cursor = self._conn.execute(query, params)
             row = cursor.fetchone()
         return dict(row) if row else None
 
-    def resolve_session_by_title(self, title: str) -> Optional[str]:
+    def resolve_session_by_title(
+        self,
+        title: str,
+        *,
+        source: str | None = None,
+        user_id: str | None = None,
+    ) -> Optional[str]:
         """Resolve a title to a session ID, preferring the latest in a lineage.
 
         If the exact title exists, returns that session's ID.
@@ -668,17 +691,25 @@ class SessionDB:
         latest numbered variant (the most recent continuation).
         """
         # First try exact match
-        exact = self.get_session_by_title(title)
+        exact = self.get_session_by_title(title, source=source, user_id=user_id)
 
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        query = (
+            "SELECT id, title, started_at FROM sessions "
+            "WHERE title LIKE ? ESCAPE '\\'"
+        )
+        params: list[Any] = [f"{escaped} #%"]
+        if source is not None:
+            query += " AND source = ?"
+            params.append(source)
+        if user_id is not None:
+            query += " AND user_id = ?"
+            params.append(user_id)
+        query += " ORDER BY started_at DESC"
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
-            )
+            cursor = self._conn.execute(query, params)
             numbered = cursor.fetchall()
 
         if numbered:
@@ -767,6 +798,7 @@ class SessionDB:
         offset: int = 0,
         include_children: bool = False,
         project_compression_tips: bool = True,
+        user_id: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -796,6 +828,9 @@ class SessionDB:
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
+        if user_id is not None:
+            where_clauses.append("s.user_id = ?")
+            params.append(user_id)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
